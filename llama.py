@@ -1,4 +1,5 @@
 import json
+import math
 from pathlib import Path
 
 import torch
@@ -139,7 +140,13 @@ class SelfAttention(nn.Module):
             .repeat_interleave(self.num_heads // self.num_key_value_heads, 1)
         )
 
-        h = torch.softmax(q @ k.transpose(2, 3), dim=-1) @ v
+        h = (q @ k.transpose(2, 3)) / math.sqrt(self.head_size)
+
+        mask = torch.triu(torch.full((T, T), float("-inf")), diagonal=1)
+
+        h = h + mask.unsqueeze(0).unsqueeze(0)
+
+        h = torch.softmax(h, dim=-1) @ v
         h = self.o_proj(
             h.transpose(1, 2).contiguous().view(B, T, self.num_heads * self.head_size)
         )
