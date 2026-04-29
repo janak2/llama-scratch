@@ -30,7 +30,5 @@ if __name__ == "__main__":
 
     print(inputs)
 
-    response = model.generate(
-        inputs["input_ids"].unsqueeze(0), inputs["attention_mask"].unsqueeze(0)
-    )
+    response = model.generate(inputs["input_ids"], inputs["attention_mask"])
     print(response)
