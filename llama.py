@@ -219,10 +219,11 @@ class Llama3(nn.Module):
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        max_new_tokens: int = 100,
+        max_new_tokens: int = 10,
     ):
         print(input_ids.shape)
         embeds = self.embed_tokens(input_ids)
+        generated_tokens = []
         for _ in range(max_new_tokens):
             hidden_states = self.forward(embeds, attention_mask)
             logits = self.lm_head(hidden_states[:, -1, :])
@@ -231,13 +232,18 @@ class Llama3(nn.Module):
             print("next_token", next_token)
 
             if next_token in self.eos_tokens:
+                print("EOS token found")
                 break
 
+            generated_tokens.append(next_token)
+
             embeds = torch.cat(
-                [embeds, self.embed_tokens(next_token.unsqueeze(1))], dim=-1
+                [embeds, self.embed_tokens(next_token.unsqueeze(1))], dim=1
             )
 
-        return input_ids
+        print("generated_tokens", generated_tokens)
+
+        return generated_tokens
 
     @staticmethod
     def from_pretrained(model_path: Path):
@@ -261,7 +267,6 @@ class Llama3(nn.Module):
                 # HF checkpoints keep the decoder under "model."; this class does not.
                 state_dict[key.removeprefix("model.")] = value
 
-        print(state_dict.keys())
         model.load_state_dict(state_dict)
 
         return model

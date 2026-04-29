@@ -23,12 +23,14 @@ if __name__ == "__main__":
 
     inputs = tokenizer.apply_chat_template(
         [{"role": "user", "content": prompt}],
-        add_generation_prompt=False,
+        add_generation_prompt=True,
         return_tensors="pt",
         return_dict=True,
     )
 
     print(inputs)
 
-    response = model.generate(inputs["input_ids"], inputs["attention_mask"])
-    print(response)
+    generated_tokens = model.generate(inputs["input_ids"], inputs["attention_mask"])
+
+    response = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+    print("response", response)
