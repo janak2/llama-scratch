@@ -134,7 +134,6 @@ class SelfAttention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        attention_mask: torch.Tensor,
         start_pos: int,
         use_kv_cache: bool,
     ):
@@ -210,13 +209,12 @@ class Layer(nn.Module):
     def forward(
         self,
         embeds: torch.Tensor,
-        attention_mask: torch.Tensor,
         start_pos: int,
         use_kv_cache: bool,
     ):
         residual = embeds
         embeds = self.input_layernorm(embeds)
-        embeds = self.self_attn(embeds, attention_mask, start_pos, use_kv_cache)
+        embeds = self.self_attn(embeds, start_pos, use_kv_cache)
         embeds = residual + embeds
         residual = embeds
         embeds = self.post_attention_layernorm(embeds)
@@ -242,6 +240,7 @@ class Llama3(nn.Module):
     ):
         super().__init__()
         self.max_seq_len = max_seq_len
+        self.max_batch_size = max_batch_size
         self.eos_tokens = eos_token
         self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
         self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
@@ -265,79 +264,109 @@ class Llama3(nn.Module):
     def forward(
         self,
         embeds: torch.Tensor,
-        attention_mask: torch.Tensor,
         start_pos: int,
         use_kv_cache: bool,
     ):
         for layer in self.layers:
-            embeds = layer(embeds, attention_mask, start_pos, use_kv_cache)
+            embeds = layer(embeds, start_pos, use_kv_cache)
         embeds = self.norm(embeds)
         return embeds
 
+    @torch.inference_mode()
     def generate(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        max_new_tokens: int = 10,
+        max_new_tokens: int = 20,
         use_kv_cache: bool = True,
     ):
         print(input_ids.shape)
+        assert input_ids.shape[0] <= self.max_batch_size, (
+            input_ids.shape[0],
+            self.max_batch_size,
+        )
         embeds = self.embed_tokens(input_ids)
-        generated_tokens = []
+        B, T, _ = embeds.shape
+        eos_reached = torch.zeros(B, dtype=torch.bool)
+        generated_tokens = [[] for _ in range(B)]
         start_pos = 0
+
+        prompt_lens = attention_mask.sum(dim=-1)
+
+        start_pos = 0
+        end_pos = prompt_lens.min().item()
         for _ in range(max_new_tokens):
             if use_kv_cache:
                 hidden_states = self.forward(
-                    embeds[:, start_pos:],
-                    attention_mask[:, start_pos:],
+                    embeds[:, start_pos:end_pos],
                     start_pos,
                     use_kv_cache=True,
                 )
+                start_pos = end_pos
+                end_pos += 1
             else:
                 hidden_states = self.forward(
-                    embeds, attention_mask, start_pos, use_kv_cache=False
+                    embeds[:, start_pos:end_pos], start_pos, use_kv_cache=False
                 )
+                end_pos += 1
             logits = self.lm_head(hidden_states[:, -1, :])
             next_token = torch.argmax(logits, dim=-1)
 
             print("next_token", next_token)
 
-            if next_token in self.eos_tokens:
-                print("EOS token found")
+            for b in range(B):
+                if next_token[b] in self.eos_tokens and end_pos > prompt_lens[b]:
+                    eos_reached[b] = True
+
+            if all(eos_reached):
                 break
 
-            generated_tokens.append(next_token)
-            start_pos = embeds.shape[1]
+            for b in range(B):
+                if not eos_reached[b] and end_pos > prompt_lens[b]:
+                    generated_tokens[b].append(next_token[b])
 
-            embeds = torch.cat(
-                [embeds, self.embed_tokens(next_token.unsqueeze(1))], dim=1
-            )
+            if end_pos > embeds.shape[1]:
+                embeds = torch.cat(
+                    [embeds, self.embed_tokens(next_token.unsqueeze(1))], dim=1
+                )
+            else:
+                for b in range(B):
+                    if end_pos > prompt_lens[b]:
+                        embeds[b, end_pos - 1] = self.embed_tokens(next_token[b])
 
         print("generated_tokens", generated_tokens)
 
         return generated_tokens
 
     @staticmethod
-    def from_pretrained(model_path: Path, max_batch_size: int = 1):
+    def from_pretrained(
+        model_path: Path,
+        max_batch_size: int = 2,
+        max_seq_len: int = 2048,
+        device: str = "cpu",
+        dtype: torch.dtype = torch.bfloat16,
+    ):
         config = json.load(open(model_path / "config.json"))
 
-        model = Llama3(
-            vocab_size=config["vocab_size"],
-            hidden_size=config["hidden_size"],
-            num_layers=config["num_hidden_layers"],
-            num_heads=config["num_attention_heads"],
-            num_key_value_heads=config["num_key_value_heads"],
-            intermediate_size=config["intermediate_size"],
-            eos_token=config["eos_token_id"],
-            rms_norm_eps=config["rms_norm_eps"],
-            rope_theta=config["rope_theta"],
-            max_seq_len=config["max_position_embeddings"],
-            max_batch_size=max_batch_size,
-        )
+        with torch.device(device):
+            torch.set_default_dtype(dtype)
+            model = Llama3(
+                vocab_size=config["vocab_size"],
+                hidden_size=config["hidden_size"],
+                num_layers=config["num_hidden_layers"],
+                num_heads=config["num_attention_heads"],
+                num_key_value_heads=config["num_key_value_heads"],
+                intermediate_size=config["intermediate_size"],
+                eos_token=config["eos_token_id"],
+                rms_norm_eps=config["rms_norm_eps"],
+                rope_theta=config["rope_theta"],
+                max_seq_len=max_seq_len,
+                max_batch_size=max_batch_size,
+            )
 
         state_dict = {}
         for shard_path in sorted(model_path.glob("model-*-of-*.safetensors")):
-            for key, value in load_file(shard_path, device="cpu").items():
+            for key, value in load_file(shard_path, device=device).items():
                 # HF checkpoints keep the decoder under "model."; this class does not.
                 state_dict[key.removeprefix("model.")] = value
 

@@ -22,19 +22,24 @@ if __name__ == "__main__":
 
     print(f"Downloaded models to {models_dir}")
 
-    model = Llama3.from_pretrained(models_dir)
     tokenizer = AutoTokenizer.from_pretrained(models_dir)
+    tokenizer.pad_token = tokenizer.eos_token
 
-    prompt = "What is the capital of France?"
-
+    prompts = [
+        "What is the capital of France?",
+        "What is the capital of United States of America?",
+    ]
     inputs = tokenizer.apply_chat_template(
-        [{"role": "user", "content": prompt}],
+        [[{"role": "user", "content": prompt}] for prompt in prompts],
         add_generation_prompt=True,
         return_tensors="pt",
         return_dict=True,
+        padding=True,
     )
 
-    print(inputs)
+    print("inputs", inputs)
+
+    model = Llama3.from_pretrained(models_dir)
 
     start_time = time.monotonic()
     generated_tokens = model.generate(
