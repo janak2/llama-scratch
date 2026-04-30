@@ -1,3 +1,4 @@
+import argparse
 import time
 from pathlib import Path
 
@@ -8,6 +9,10 @@ from transformers import AutoTokenizer
 ROOT_DIR = Path(__file__).parent
 
 if __name__ == "__main__":
+    args = argparse.ArgumentParser()
+    args.add_argument("--use_kv_cache", action="store_true")
+    args = args.parse_args()
+
     models_dir = ROOT_DIR / "models"
     models_dir.mkdir(parents=True, exist_ok=True)
     snapshot_download(
@@ -32,7 +37,9 @@ if __name__ == "__main__":
     print(inputs)
 
     start_time = time.monotonic()
-    generated_tokens = model.generate(inputs["input_ids"], inputs["attention_mask"])
+    generated_tokens = model.generate(
+        inputs["input_ids"], inputs["attention_mask"], use_kv_cache=args.use_kv_cache
+    )
 
     response = tokenizer.decode(generated_tokens, skip_special_tokens=True)
     end_time = time.monotonic()

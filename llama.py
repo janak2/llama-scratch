@@ -148,7 +148,10 @@ class SelfAttention(nn.Module):
         k = k.view(B, T, self.num_key_value_heads, self.head_size)
         v = v.view(B, T, self.num_key_value_heads, self.head_size)
 
-        q, k = self.apply_rotary_emb(q, k, start_pos)
+        if use_kv_cache:
+            q, k = self.apply_rotary_emb(q, k, start_pos)
+        else:
+            q, k = self.apply_rotary_emb(q, k, 0)
 
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
