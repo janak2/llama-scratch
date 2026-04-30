@@ -41,6 +41,8 @@ class SelfAttention(nn.Module):
         num_heads: int,
         num_key_value_heads: int,
         rope_theta: float,
+        max_seq_len: int,
+        max_batch_size: int,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -48,6 +50,8 @@ class SelfAttention(nn.Module):
         self.head_size = hidden_size // num_heads
         self.hidden_size = hidden_size
         self.rope_theta = rope_theta
+        self.max_seq_len = max_seq_len
+        self.max_batch_size = max_batch_size
         self.device = "cpu"
 
         self.q_proj = nn.Linear(hidden_size, self.head_size * num_heads, bias=False)
@@ -58,6 +62,15 @@ class SelfAttention(nn.Module):
             hidden_size, self.head_size * num_key_value_heads, bias=False
         )
         self.o_proj = nn.Linear(self.head_size * num_heads, hidden_size, bias=False)
+
+        self.kv_cache = {
+            "k": torch.zeros(
+                max_batch_size, num_key_value_heads, max_seq_len, self.head_size
+            ),
+            "v": torch.zeros(
+                max_batch_size, num_key_value_heads, max_seq_len, self.head_size
+            ),
+        }
 
         self.freqs_cis = self.precompute_freqs_cis()
 
@@ -108,16 +121,23 @@ class SelfAttention(nn.Module):
         self,
         xq: torch.Tensor,
         xk: torch.Tensor,
+        start_pos: int,
     ):
         xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
         xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-        freqs_cis = self.freqs_cis[: xq.shape[1]]
+        freqs_cis = self.freqs_cis[start_pos : start_pos + xq.shape[1]]
         freqs_cis = self.reshape_for_broadcast(freqs_cis, xq_)
         xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
         xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
         return xq_out.type_as(xq), xk_out.type_as(xk)
 
-    def forward(self, x: torch.Tensor, attention_mask: torch.Tensor):
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_mask: torch.Tensor,
+        start_pos: int,
+        use_kv_cache: bool,
+    ):
         B, T, _ = x.shape
 
         q = self.q_proj(x)
@@ -126,19 +146,22 @@ class SelfAttention(nn.Module):
 
         q = q.view(B, T, self.num_heads, self.head_size)
         k = k.view(B, T, self.num_key_value_heads, self.head_size)
+        v = v.view(B, T, self.num_key_value_heads, self.head_size)
 
-        q, k = self.apply_rotary_emb(q, k)
+        q, k = self.apply_rotary_emb(q, k, start_pos)
 
         q = q.transpose(1, 2)
-        k = k.transpose(1, 2).repeat_interleave(
-            self.num_heads // self.num_key_value_heads, 1
-        )
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
 
-        v = (
-            v.view(B, T, self.num_key_value_heads, self.head_size)
-            .transpose(1, 2)
-            .repeat_interleave(self.num_heads // self.num_key_value_heads, 1)
-        )
+        if use_kv_cache:
+            self.kv_cache["k"][:B, :, start_pos : start_pos + T] = k
+            self.kv_cache["v"][:B, :, start_pos : start_pos + T] = v
+            k = self.kv_cache["k"][:B, :, : start_pos + T]
+            v = self.kv_cache["v"][:B, :, : start_pos + T]
+
+        k = k.repeat_interleave(self.num_heads // self.num_key_value_heads, 1)
+        v = v.repeat_interleave(self.num_heads // self.num_key_value_heads, 1)
 
         h = (q @ k.transpose(2, 3)) / math.sqrt(self.head_size)
 
@@ -163,19 +186,34 @@ class Layer(nn.Module):
         intermediate_size: int,
         rms_norm_eps: float,
         rope_theta: float,
+        max_seq_len: int,
+        max_batch_size: int,
     ):
         super().__init__()
+        self.max_seq_len = max_seq_len
+        self.max_batch_size = max_batch_size
         self.input_layernorm = RMSNorm(hidden_size, rms_norm_eps)
         self.self_attn = SelfAttention(
-            hidden_size, num_heads, num_key_value_heads, rope_theta
+            hidden_size,
+            num_heads,
+            num_key_value_heads,
+            rope_theta,
+            max_seq_len,
+            max_batch_size,
         )
         self.mlp = MultiLayerPerceptron(hidden_size, intermediate_size)
         self.post_attention_layernorm = RMSNorm(hidden_size, rms_norm_eps)
 
-    def forward(self, embeds: torch.Tensor, attention_mask: torch.Tensor):
+    def forward(
+        self,
+        embeds: torch.Tensor,
+        attention_mask: torch.Tensor,
+        start_pos: int,
+        use_kv_cache: bool,
+    ):
         residual = embeds
         embeds = self.input_layernorm(embeds)
-        embeds = self.self_attn(embeds, attention_mask)
+        embeds = self.self_attn(embeds, attention_mask, start_pos, use_kv_cache)
         embeds = residual + embeds
         residual = embeds
         embeds = self.post_attention_layernorm(embeds)
@@ -196,8 +234,11 @@ class Llama3(nn.Module):
         eos_token: list[int],
         rms_norm_eps: float,
         rope_theta: float,
+        max_seq_len: int,
+        max_batch_size: int,
     ):
         super().__init__()
+        self.max_seq_len = max_seq_len
         self.eos_tokens = eos_token
         self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
         self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
@@ -211,14 +252,22 @@ class Llama3(nn.Module):
                     intermediate_size,
                     rms_norm_eps,
                     rope_theta,
+                    max_seq_len,
+                    max_batch_size,
                 )
                 for _ in range(num_layers)
             ]
         )
 
-    def forward(self, embeds: torch.Tensor, attention_mask: torch.Tensor):
+    def forward(
+        self,
+        embeds: torch.Tensor,
+        attention_mask: torch.Tensor,
+        start_pos: int,
+        use_kv_cache: bool,
+    ):
         for layer in self.layers:
-            embeds = layer(embeds, attention_mask)
+            embeds = layer(embeds, attention_mask, start_pos, use_kv_cache)
         embeds = self.norm(embeds)
         return embeds
 
@@ -227,12 +276,24 @@ class Llama3(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         max_new_tokens: int = 10,
+        use_kv_cache: bool = True,
     ):
         print(input_ids.shape)
         embeds = self.embed_tokens(input_ids)
         generated_tokens = []
+        start_pos = 0
         for _ in range(max_new_tokens):
-            hidden_states = self.forward(embeds, attention_mask)
+            if use_kv_cache:
+                hidden_states = self.forward(
+                    embeds[:, start_pos:],
+                    attention_mask[:, start_pos:],
+                    start_pos,
+                    use_kv_cache=True,
+                )
+            else:
+                hidden_states = self.forward(
+                    embeds, attention_mask, start_pos, use_kv_cache=False
+                )
             logits = self.lm_head(hidden_states[:, -1, :])
             next_token = torch.argmax(logits, dim=-1)
 
@@ -243,6 +304,7 @@ class Llama3(nn.Module):
                 break
 
             generated_tokens.append(next_token)
+            start_pos = embeds.shape[1]
 
             embeds = torch.cat(
                 [embeds, self.embed_tokens(next_token.unsqueeze(1))], dim=1
@@ -253,7 +315,7 @@ class Llama3(nn.Module):
         return generated_tokens
 
     @staticmethod
-    def from_pretrained(model_path: Path):
+    def from_pretrained(model_path: Path, max_batch_size: int = 1):
         config = json.load(open(model_path / "config.json"))
 
         model = Llama3(
@@ -266,6 +328,8 @@ class Llama3(nn.Module):
             eos_token=config["eos_token_id"],
             rms_norm_eps=config["rms_norm_eps"],
             rope_theta=config["rope_theta"],
+            max_seq_len=config["max_position_embeddings"],
+            max_batch_size=max_batch_size,
         )
 
         state_dict = {}

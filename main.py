@@ -1,3 +1,4 @@
+import time
 from pathlib import Path
 
 from huggingface_hub import snapshot_download
@@ -30,7 +31,10 @@ if __name__ == "__main__":
 
     print(inputs)
 
+    start_time = time.monotonic()
     generated_tokens = model.generate(inputs["input_ids"], inputs["attention_mask"])
 
     response = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+    end_time = time.monotonic()
+    print(f"Time taken: {end_time - start_time} seconds")
     print("response", response)
